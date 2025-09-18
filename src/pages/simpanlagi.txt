@@ -1,0 +1,462 @@
+import { useState, useEffect, useMemo, useRef } from "react";
+import { GetServerSideProps } from "next";
+import { AdapterDayjs } from "@mui/x-date-pickers/AdapterDayjs";
+import { LocalizationProvider } from "@mui/x-date-pickers/LocalizationProvider";
+import { DatePicker } from "@mui/x-date-pickers/DatePicker";
+import { v4 as uuidv4 } from "uuid";
+import {
+  Box,
+  Button,
+  FormControl,
+  InputLabel,
+  Select,
+  MenuItem,
+} from "@mui/material";
+import "react-toastify/dist/ReactToastify.css";
+import { ToastContainer, toast } from "react-toastify";
+
+import AdCard from "../components/AdCard";
+import DropZone from "../components/DropZone";
+import FloatingToolbar from "../components/FloatingToolbar";
+import { Ad } from "../types/ad";
+import { fetchAdsFromSheet } from "../fetcher/googleSheets";
+import dayjs, { Dayjs } from "dayjs";
+import React from "react";
+
+interface Props {
+  ads: Ad[];
+}
+
+export default function Home({ ads: initialAds }: Props) {
+  const [ads, setAds] = useState<Ad[]>(initialAds);
+  const [selectMode, setSelectMode] = useState(false);
+  const [selectedAds, setSelectedAds] = useState<Set<string>>(new Set());
+  const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
+
+  // Date filters
+  const today = dayjs();
+  const thirtyDaysAgo = today.subtract(30, "day");
+  const [startDate, setStartDate] = useState<Dayjs | null>(thirtyDaysAgo);
+  const [endDate, setEndDate] = useState<Dayjs | null>(today);
+
+  // Brand/site list for filter dropdown
+  const sortedSites = useMemo(
+    () => Array.from(new Set(ads.map((ad) => ad.sites))).sort(),
+    [ads]
+  );
+  const [selectedSite, setSelectedSite] = React.useState<string>(
+    sortedSites[0]
+  );
+
+  // Apply filters
+  const filteredBySite = selectedSite
+    ? ads.filter((a) => a.sites === selectedSite)
+    : ads;
+  const filteredAds = filteredBySite.filter((ad) => {
+    const date = dayjs(ad.start_date);
+    return (
+      (!startDate || date.isAfter(startDate)) &&
+      (!endDate || date.isBefore(endDate))
+    );
+  });
+
+  const totalAdsInRange = filteredAds.reduce((sum, ad) => {
+    const count = Number(ad.ads_count);
+    return sum + (isNaN(count) ? 0 : count);
+  }, 0);
+  const groupsContainerRef = useRef<HTMLDivElement | null>(null);
+
+  // Handle grouping logic
+  const ungrouped = filteredAds.filter((ad) => !ad.group);
+  const groupedMap: Record<string, Ad[]> = {};
+  filteredAds.forEach((ad) => {
+    if (ad.group) {
+      groupedMap[ad.group] = groupedMap[ad.group] || [];
+      groupedMap[ad.group].push(ad);
+    }
+  });
+  const groupIds = Object.keys(groupedMap);
+
+  // Toggle select mode
+  const toggleSelect = (id: string) => {
+    setSelectedAds((prev) => {
+      const copy = new Set(prev);
+      if (copy.has(id)) {
+        copy.delete(id);
+      } else {
+        copy.add(id);
+      }
+      return copy;
+    });
+  };
+
+  // Move an ad between groups
+  const handleMoveAd = (libraryId: string, destId: string) => {
+    setAds((prev) =>
+      prev.map((ad) =>
+        ad.library_id === libraryId
+          ? { ...ad, group: destId === "ungrouped" ? undefined : destId }
+          : ad
+      )
+    );
+    setHasUnsavedChanges(true);
+  };
+
+  // Move selected ads to a specific group
+  const handleMultiMove = (group: string) => {
+    setAds((prev) =>
+      prev.map((ad) => (selectedAds.has(ad.library_id) ? { ...ad, group } : ad))
+    );
+    setSelectedAds(new Set());
+    setHasUnsavedChanges(true);
+  };
+
+  // Remove selected ads from their groups
+  const handleMultiRemove = () => {
+    setAds((prev) =>
+      prev.map((ad) =>
+        selectedAds.has(ad.library_id) ? { ...ad, group: undefined } : ad
+      )
+    );
+    setSelectedAds(new Set());
+    setHasUnsavedChanges(true);
+  };
+
+  // Save changes to the server
+  const handleSave = async () => {
+    const groupsToUpdate = ads.map((ad) => ad.group || "");
+    const res = await fetch("/api/save-groups", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ groups: groupsToUpdate }),
+    });
+    if (res.ok) {
+      toast.success("Changes saved!");
+    } else {
+      toast.error("Failed to save.");
+    }
+    setHasUnsavedChanges(false);
+  };
+
+  // Function to remove group with confirmation
+  const handleRemoveGroup = (groupId: string) => {
+    const isConfirmed = window.confirm(
+      `Are you sure you want to delete this group? All ads in this group will be moved to the ungrouped section.`
+    );
+    if (isConfirmed) {
+      // Remove the group from the groups list
+      setGroups((prevGroups) =>
+        prevGroups.filter((group) => group !== groupId)
+      );
+
+      // Remove group mapping from groupBrandMap
+      setGroupBrandMap((prevMap) => {
+        const updatedMap = { ...prevMap };
+        delete updatedMap[groupId];
+        return updatedMap;
+      });
+
+      // Move all ads in this group back to ungrouped
+      setAds((prevAds) =>
+        prevAds.map((ad) =>
+          ad.group === groupId ? { ...ad, group: undefined } : ad
+        )
+      );
+
+      setHasUnsavedChanges(true);
+    }
+  };
+
+  // Handling window unload for unsaved changes
+  useEffect(() => {
+    const handler = (e: BeforeUnloadEvent) => {
+      if (hasUnsavedChanges) {
+        e.preventDefault();
+      }
+    };
+    window.addEventListener("beforeunload", handler);
+    return () => window.removeEventListener("beforeunload", handler);
+  }, [hasUnsavedChanges]);
+
+  // Initialize state for groups (group names) and group-brand mapping
+  const [groups, setGroups] = useState<string[]>(() => {
+    const existingGroups = new Set<string>();
+    initialAds.forEach((ad) => {
+      if (ad.group && ad.group.trim()) {
+        existingGroups.add(ad.group.trim());
+      }
+    });
+    return Array.from(existingGroups);
+  });
+
+  const [groupBrandMap, setGroupBrandMap] = useState<Record<string, string>>(
+    () => {
+      const map: Record<string, string> = {};
+      initialAds.forEach((ad) => {
+        if (ad.group && ad.sites) {
+          map[ad.group] = ad.sites;
+        }
+      });
+      return map;
+    }
+  );
+
+  // Handle adding new group
+  const handleAddGroup = () => {
+    if (!selectedSite) {
+      alert("Please select a brand before adding a group.");
+      return;
+    }
+
+    const newGroupId = uuidv4(); // Generate a new unique ID for the new group
+
+    // Add the new group to the list of groups
+    setGroups((prevGroups) => {
+      const updatedGroups = [...prevGroups, newGroupId];
+      // Scroll to the bottom after the group is added
+      if (groupsContainerRef.current) {
+        setTimeout(() => {
+          groupsContainerRef.current?.scrollTo({
+            top: groupsContainerRef.current.scrollHeight,
+            behavior: "smooth",
+          });
+        }, 100);
+      }
+      return updatedGroups;
+    });
+
+    // Map the new group to the selected brand/site
+    setGroupBrandMap((prevMap) => ({
+      ...prevMap,
+      [newGroupId]: selectedSite,
+    }));
+
+    // Assign the new group to the selected ads
+    setAds((prevAds) =>
+      prevAds.map((ad) =>
+        selectedAds.has(ad.library_id) ? { ...ad, group: newGroupId } : ad
+      )
+    );
+
+    // Clear selected ads and mark changes as unsaved
+    setSelectedAds(new Set());
+    setHasUnsavedChanges(true);
+  };
+
+  return (
+    <Box p={4} maxWidth="1200px" mx="auto">
+      <ToastContainer />
+      <Box
+        display="flex"
+        alignItems="center"
+        justifyContent="space-between"
+        mb={4}
+      >
+        <h1>Ad Library</h1>
+        <Box display="flex" gap={2}>
+          <Button
+            variant="contained"
+            color="primary"
+            onClick={handleSave}
+            disabled={!hasUnsavedChanges}
+          >
+            Save Changes
+          </Button>
+          <Button
+            variant="outlined"
+            color="primary"
+            onClick={() => {
+              setSelectMode(!selectMode);
+              setSelectedAds(new Set());
+            }}
+          >
+            {selectMode ? "Cancel Select" : "Select Ads"}
+          </Button>
+        </Box>
+      </Box>
+
+      <Box display="flex" gap={2} flexWrap="wrap" mb={4}>
+        <FormControl sx={{ minWidth: 200 }}>
+          <InputLabel>Brand</InputLabel>
+          <Select
+            value={selectedSite}
+            label="Brand"
+            onChange={(e) => setSelectedSite(e.target.value)}
+          >
+            {sortedSites.map((site) => (
+              <MenuItem key={site} value={site}>
+                {site}
+              </MenuItem>
+            ))}
+          </Select>
+        </FormControl>
+
+        <LocalizationProvider dateAdapter={AdapterDayjs}>
+          <DatePicker
+            label="Start Date"
+            value={startDate}
+            onChange={(newValue) => setStartDate(newValue)}
+            format="YYYY-MM-DD"
+          />
+        </LocalizationProvider>
+
+        <LocalizationProvider dateAdapter={AdapterDayjs}>
+          <DatePicker
+            label="End Date"
+            value={endDate}
+            onChange={(newValue) => setEndDate(newValue)}
+            format="YYYY-MM-DD"
+          />
+        </LocalizationProvider>
+
+        <Button
+          variant="text"
+          onClick={() => {
+            setStartDate(thirtyDaysAgo);
+            setEndDate(today);
+          }}
+        >
+          Clear Filters
+        </Button>
+      </Box>
+
+      {selectMode && selectedAds.size > 0 && (
+        <FloatingToolbar
+          count={selectedAds.size}
+          onClear={() => setSelectedAds(new Set())}
+          onRemove={handleMultiRemove}
+          onMove={handleMultiMove}
+          groups={groupIds}
+        />
+      )}
+      <Box display="flex" justifyContent="space-between" mb={4}>
+        <div className="text-md">
+          Total ads (all groups) from{" "}
+          <strong>{startDate?.toISOString().split("T")[0]}</strong> to{" "}
+          <strong>{endDate?.toISOString().split("T")[0]}</strong>:{" "}
+          {totalAdsInRange}
+        </div>
+
+        <Button
+          variant="contained"
+          color="primary"
+          onClick={handleAddGroup}
+          sx={{ padding: "8px 16px" }}
+        >
+          + Add New Group
+        </Button>
+      </Box>
+
+      <Box display="flex" gap={4}>
+        <Box
+          flex={1}
+          maxHeight="70vh"
+          overflow="auto"
+          position="sticky"
+          top={0}
+        >
+          <DropZone
+            zoneId="ungrouped"
+            onItemDropped={handleMoveAd}
+            className="bg-gray-100 p-4 rounded-xl"
+          >
+            <h2 className="mb-4">
+              Ungrouped (
+              {ungrouped.reduce((sum, ad) => {
+                const count = Number(ad.ads_count);
+                return sum + (isNaN(count) ? 0 : count);
+              }, 0)}
+              )
+            </h2>
+            <Box
+              display="grid"
+              gridTemplateColumns="repeat(auto-fill,minmax(150px,1fr))"
+              gap={2}
+            >
+              {ungrouped.map((ad) => (
+                <AdCard
+                  key={ad.library_id}
+                  ad={ad}
+                  selected={selectedAds.has(ad.library_id)}
+                  selectMode={selectMode}
+                  toggleSelect={toggleSelect}
+                />
+              ))}
+            </Box>
+          </DropZone>
+        </Box>
+
+        <Box
+          flex={1}
+          maxHeight="70vh"
+          overflow="auto"
+          className="flex flex-col gap-4"
+          ref={groupsContainerRef}
+        >
+          {/* Render the groups dynamically */}
+          {groups.map((groupId) => {
+            const groupAds = groupedMap[groupId] || [];
+            // Calculate the total ads count for the group based on `ads_count`
+            const totalAdsInGroup = groupAds.reduce((sum, ad) => {
+              const count = Number(ad.ads_count);
+              return sum + (isNaN(count) ? 0 : count);
+            }, 0);
+
+            return (
+              <DropZone
+                key={groupId}
+                zoneId={groupId}
+                onItemDropped={handleMoveAd}
+                className="bg-gray-100 p-4 rounded-xl mb-2"
+                style={{ minHeight: groupAds.length === 0 ? "150px" : "auto" }} // Add min-height if group is empty
+              >
+                <div className="flex items-center justify-between">
+                  <div className="mb-2">
+                    Total{" "}
+                    <span className="text-blue-500">{totalAdsInGroup}</span> ads
+                    in this group
+                  </div>
+                  <Button
+                    variant="outlined"
+                    color="secondary"
+                    onClick={() => handleRemoveGroup(groupId)}
+                  >
+                    Delete Group
+                  </Button>
+                </div>
+
+                {/* If the group is empty, show a placeholder */}
+                {groupAds.length === 0 ? (
+                  <div className="flex items-center justify-center text-gray-500 p-4">
+                    Drag and drop here to make a group
+                  </div>
+                ) : (
+                  <Box
+                    display="grid"
+                    gridTemplateColumns="repeat(auto-fill,minmax(150px,1fr))"
+                    gap={2}
+                  >
+                    {groupAds.map((ad) => (
+                      <AdCard
+                        key={ad.library_id}
+                        ad={ad}
+                        selected={selectedAds.has(ad.library_id)}
+                        selectMode={selectMode}
+                        toggleSelect={toggleSelect}
+                      />
+                    ))}
+                  </Box>
+                )}
+              </DropZone>
+            );
+          })}
+        </Box>
+      </Box>
+    </Box>
+  );
+}
+
+export const getServerSideProps: GetServerSideProps = async () => {
+  const ads = await fetchAdsFromSheet();
+  return { props: { ads } };
+};

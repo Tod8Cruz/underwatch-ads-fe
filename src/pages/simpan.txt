@@ -1,0 +1,336 @@
+import { useState, useEffect, useMemo } from "react";
+import { GetServerSideProps } from "next";
+import { AdapterDayjs } from "@mui/x-date-pickers/AdapterDayjs";
+import { LocalizationProvider } from "@mui/x-date-pickers/LocalizationProvider";
+import { DatePicker } from "@mui/x-date-pickers/DatePicker";
+
+import {
+  Box,
+  Button,
+  FormControl,
+  InputLabel,
+  Select,
+  MenuItem,
+} from "@mui/material";
+import "react-toastify/dist/ReactToastify.css";
+import { ToastContainer, toast } from "react-toastify";
+
+import AdCard from "../components/AdCard";
+import DropZone from "../components/DropZone";
+import FloatingToolbar from "../components/FloatingToolbar";
+import { Ad } from "../types/ad";
+import { fetchAdsFromSheet } from "../fetcher/googleSheets";
+import dayjs, { Dayjs } from "dayjs";
+import React from "react";
+
+interface Props {
+  ads: Ad[];
+}
+
+export default function Home({ ads: initialAds }: Props) {
+  const [ads, setAds] = useState<Ad[]>(initialAds);
+  const [selectMode, setSelectMode] = useState(false);
+  const [selectedAds, setSelectedAds] = useState<Set<string>>(new Set());
+  const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
+
+  // Date filters
+  const today = dayjs();
+  const thirtyDaysAgo = today.subtract(30, "day");
+  const [startDate, setStartDate] = useState<Dayjs | null>(thirtyDaysAgo);
+  const [endDate, setEndDate] = useState<Dayjs | null>(today);
+
+  // Brand/site list for filter dropdown
+  const sortedSites = useMemo(
+    () => Array.from(new Set(ads.map((ad) => ad.sites))).sort(),
+    [ads]
+  );
+  const [selectedSite, setSelectedSite] = React.useState<string>(
+    sortedSites[0]
+  );
+
+  // Apply filters
+  const filteredBySite = selectedSite
+    ? ads.filter((a) => a.sites === selectedSite)
+    : ads;
+  const filteredAds = filteredBySite.filter((ad) => {
+    const date = dayjs(ad.start_date);
+    return (
+      (!startDate || date.isAfter(startDate)) &&
+      (!endDate || date.isBefore(endDate))
+    );
+  });
+
+  const ungrouped = filteredAds.filter((ad) => !ad.group);
+  const groupedMap: Record<string, Ad[]> = {};
+  filteredAds.forEach((ad) => {
+    if (ad.group) {
+      groupedMap[ad.group] = groupedMap[ad.group] || [];
+      groupedMap[ad.group].push(ad);
+    }
+  });
+  const groupIds = Object.keys(groupedMap);
+
+  const toggleSelect = (id: string) => {
+    setSelectedAds((prev) => {
+      const copy = new Set(prev);
+      if (copy.has(id)) {
+        copy.delete(id);
+      } else {
+        copy.add(id);
+      }
+      return copy;
+    });
+  };
+
+  const handleMoveAd = (libraryId: string, destId: string) => {
+    setAds((prev) =>
+      prev.map((ad) =>
+        ad.library_id === libraryId
+          ? { ...ad, group: destId === "ungrouped" ? undefined : destId }
+          : ad
+      )
+    );
+    setHasUnsavedChanges(true);
+  };
+
+  const handleMultiMove = (group: string) => {
+    setAds((prev) =>
+      prev.map((ad) => (selectedAds.has(ad.library_id) ? { ...ad, group } : ad))
+    );
+    setSelectedAds(new Set());
+    setHasUnsavedChanges(true);
+  };
+
+  const handleMultiRemove = () => {
+    setAds((prev) =>
+      prev.map((ad) =>
+        selectedAds.has(ad.library_id) ? { ...ad, group: undefined } : ad
+      )
+    );
+    setSelectedAds(new Set());
+    setHasUnsavedChanges(true);
+  };
+
+  const handleSave = async () => {
+    const groupsToUpdate = ads.map((ad) => ad.group || "");
+    const res = await fetch("/api/save-groups", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ groups: groupsToUpdate }),
+    });
+    if (res.ok) {
+      toast.success("Changes saved!");
+    } else {
+      toast.error("Failed to save.");
+    }
+    setHasUnsavedChanges(false);
+  };
+
+  useEffect(() => {
+    const handler = (e: BeforeUnloadEvent) => {
+      if (hasUnsavedChanges) {
+        e.preventDefault();
+      }
+    };
+    window.addEventListener("beforeunload", handler);
+    return () => window.removeEventListener("beforeunload", handler);
+  }, [hasUnsavedChanges]);
+
+  return (
+    <Box p={4} maxWidth="1200px" mx="auto">
+      <ToastContainer />
+      <Box
+        display="flex"
+        alignItems="center"
+        justifyContent="space-between"
+        mb={4}
+      >
+        <h1>Ad Library</h1>
+        <Box display="flex" gap={2}>
+          <Button
+            variant="contained"
+            color="primary"
+            onClick={handleSave}
+            disabled={!hasUnsavedChanges}
+          >
+            Save Changes
+          </Button>
+          <Button
+            variant="outlined"
+            color="primary"
+            onClick={() => {
+              setSelectMode(!selectMode);
+              setSelectedAds(new Set());
+            }}
+          >
+            {selectMode ? "Cancel Select" : "Select Ads"}
+          </Button>
+        </Box>
+      </Box>
+
+      <Box display="flex" gap={2} flexWrap="wrap" mb={4}>
+        <FormControl sx={{ minWidth: 200 }}>
+          <InputLabel>Brand</InputLabel>
+          <Select
+            value={selectedSite}
+            label="Brand"
+            onChange={(e) => setSelectedSite(e.target.value)}
+          >
+            {sortedSites.map((site) => (
+              <MenuItem key={site} value={site}>
+                {site}
+              </MenuItem>
+            ))}
+          </Select>
+        </FormControl>
+
+        <LocalizationProvider dateAdapter={AdapterDayjs}>
+          <DatePicker
+            label="Start Date"
+            value={startDate}
+            onChange={(newValue) => setStartDate(newValue)}
+            format="YYYY-MM-DD"
+          />
+        </LocalizationProvider>
+
+        <LocalizationProvider dateAdapter={AdapterDayjs}>
+          <DatePicker
+            label="End Date"
+            value={endDate}
+            onChange={(newValue) => setEndDate(newValue)}
+            format="YYYY-MM-DD"
+          />
+        </LocalizationProvider>
+
+        <Button
+          variant="text"
+          onClick={() => {
+            setStartDate(thirtyDaysAgo);
+            setEndDate(today);
+          }}
+        >
+          Clear Filters
+        </Button>
+
+        {/* <LocalizationProvider dateAdapter={AdapterDateFns}>
+          <DatePicker
+            label="Start Date"
+            value={startDate}
+            onChange={(newDate) => setStartDate(newDate)}
+            inputFormat="yyyy-MM-dd"
+            renderInput={(params) => (
+              <TextField {...params} size="small" fullWidth />
+            )}
+          />
+        </LocalizationProvider> */}
+        {/* <LocalizationProvider dateAdapter={AdapterDateFns}>
+          <DatePicker
+            label="End Date"
+            value={endDate}
+            onChange={(newDate) => setEndDate(newDate)}
+            inputFormat="yyyy-MM-dd"
+            renderInput={(params) => (
+              <TextField {...params} size="small" fullWidth />
+            )}
+          />
+        </LocalizationProvider> */}
+        {/* <Button
+          variant="text"
+          onClick={() => {
+            setStartDate(thirtyDaysAgo);
+            setEndDate(today);
+          }}
+        >
+          Clear Filters
+        </Button> */}
+      </Box>
+
+      {selectMode && selectedAds.size > 0 && (
+        <FloatingToolbar
+          count={selectedAds.size}
+          onClear={() => setSelectedAds(new Set())}
+          onRemove={handleMultiRemove}
+          onMove={handleMultiMove}
+          groups={groupIds}
+        />
+      )}
+
+      <Box display="flex" gap={4}>
+        <Box
+          flex={1}
+          maxHeight="70vh"
+          overflow="auto"
+          position="sticky"
+          top={0}
+        >
+          <DropZone
+            zoneId="ungrouped"
+            onItemDropped={handleMoveAd}
+            className="bg-gray-100 p-4 rounded-xl"
+          >
+            <h2>Ungrouped ({ungrouped.length})</h2>
+            <Box
+              display="grid"
+              gridTemplateColumns="repeat(auto-fill,minmax(150px,1fr))"
+              gap={2}
+            >
+              {ungrouped.map((ad) => (
+                <AdCard
+                  key={ad.library_id}
+                  ad={ad}
+                  selected={selectedAds.has(ad.library_id)}
+                  selectMode={selectMode}
+                  toggleSelect={toggleSelect}
+                />
+              ))}
+            </Box>
+          </DropZone>
+        </Box>
+
+        <Box
+          flex={1}
+          maxHeight="70vh"
+          overflow="auto"
+          className="flex flex-col gap-4"
+        >
+          {groupIds.map((groupId) => (
+            <DropZone
+              key={groupId}
+              zoneId={groupId}
+              onItemDropped={handleMoveAd}
+              className="bg-gray-100 p-4 rounded-xl mb={2}"
+            >
+              <h2>
+                Total{" "}
+                <span className="text-blue-500">
+                  {groupedMap[groupId].length}
+                </span>{" "}
+                ads in this group
+              </h2>
+              <Box
+                display="grid"
+                gridTemplateColumns="repeat(auto-fill,minmax(150px,1fr))"
+                gap={2}
+              >
+                {groupedMap[groupId].map((ad) => (
+                  <AdCard
+                    key={ad.library_id}
+                    ad={ad}
+                    selected={selectedAds.has(ad.library_id)}
+                    selectMode={selectMode}
+                    toggleSelect={toggleSelect}
+                  />
+                ))}
+              </Box>
+            </DropZone>
+          ))}
+        </Box>
+      </Box>
+    </Box>
+  );
+}
+
+export const getServerSideProps: GetServerSideProps = async () => {
+  const ads = await fetchAdsFromSheet();
+  return { props: { ads } };
+};
