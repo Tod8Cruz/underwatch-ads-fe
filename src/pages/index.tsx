@@ -302,7 +302,7 @@ export default function Home({ ads: initialAds }: Props) {
   );
 
   return (
-    <Box p={4} maxWidth="1200px" mx="auto">
+    <Box p={4} maxWidth="1200px" mx="auto" sx={{ backgroundColor: 'blue', minHeight: '100vh' }}>
       <ToastContainer />
 
       <Box
